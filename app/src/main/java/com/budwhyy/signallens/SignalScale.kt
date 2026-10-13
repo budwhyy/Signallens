@@ -28,13 +28,31 @@ object SignalScale {
         return stops.last().second
     }
 
-    fun label(rssi: Int): String = when {
-        rssi >= -55 -> "Excellent"
-        rssi >= -65 -> "Good"
-        rssi >= -72 -> "Fair"
-        rssi >= -80 -> "Weak"
-        else -> "Dead zone"
+    /** 0..4, matching the [LABELS] index. */
+    fun level(rssi: Int): Int = when {
+        rssi >= -55 -> 4
+        rssi >= -65 -> 3
+        rssi >= -72 -> 2
+        rssi >= -80 -> 1
+        else -> 0
     }
+
+    fun label(rssi: Int): String = LABELS[level(rssi)]
+
+    /** What the signal is good for, in everyday terms. */
+    fun meaning(rssi: Int): String = when (level(rssi)) {
+        4 -> "Great for video calls and 4K streaming"
+        3 -> "Good for streaming and video calls"
+        2 -> "Fine for browsing, video may stutter"
+        1 -> "Slow, and may drop out"
+        else -> "Wi-Fi will barely work here"
+    }
+
+    /** Representative colour of each level, for the colour key. */
+    fun levelColor(level: Int): Int = color(intArrayOf(-90, -76, -68, -60, -45)[level])
+
+    /** Weakest to strongest. */
+    val LABELS = listOf("Dead zone", "Weak", "Fair", "Good", "Excellent")
 
     private fun blend(a: Int, b: Int, t: Float): Int {
         fun ch(x: Int, y: Int) = (x + (y - x) * t).toInt()

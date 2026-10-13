@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Typeface
 import android.view.View
 
 /** A signal sample projected onto the screen for the current frame. */
@@ -26,12 +25,7 @@ class OverlayView(context: Context) : View(context) {
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
     }
-    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        setShadowLayer(3f * density, 0f, 0f, Color.BLACK)
-    }
+    private val bar = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val reticle = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 3f * density
@@ -40,6 +34,22 @@ class OverlayView(context: Context) : View(context) {
     fun setMarkers(list: List<ScreenMarker>) {
         markers = list
         postInvalidateOnAnimation()
+    }
+
+    /** Phone-style signal bars (4 bars, [level] of them lit) centred in a bubble. */
+    private fun drawBars(canvas: Canvas, cx: Float, cy: Float, radius: Float, level: Int) {
+        val w = radius * 1.0f
+        val h = radius * 0.75f
+        val gap = w * 0.08f
+        val barW = (w - gap * 3) / 4
+        val left = cx - w / 2
+        val bottom = cy + h / 2
+        for (i in 0 until 4) {
+            bar.color = if (i < level) Color.WHITE else Color.argb(90, 255, 255, 255)
+            val x = left + i * (barW + gap)
+            val top = bottom - h * (i + 1) / 4f
+            canvas.drawRoundRect(x, top, x + barW, bottom, barW * 0.25f, barW * 0.25f, bar)
+        }
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -53,10 +63,7 @@ class OverlayView(context: Context) : View(context) {
             stroke.color = c
             canvas.drawCircle(m.x, m.y, m.radius, fill)
             canvas.drawCircle(m.x, m.y, m.radius, stroke)
-            if (m.radius > 18f * density) {
-                text.textSize = (m.radius * 0.55f).coerceIn(10f * density, 22f * density)
-                canvas.drawText("${m.rssi}", m.x, m.y + text.textSize / 3f, text)
-            }
+            if (m.radius > 14f * density) drawBars(canvas, m.x, m.y, m.radius, SignalScale.level(m.rssi))
         }
 
         // Centre reticle coloured by the live signal at the phone's current position.

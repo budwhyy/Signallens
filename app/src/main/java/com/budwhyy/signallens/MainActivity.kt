@@ -1,6 +1,7 @@
 package com.budwhyy.signallens
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -13,17 +14,25 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.view.Gravity
 import android.view.Surface
+import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.google.ar.core.Anchor
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
@@ -58,9 +67,13 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val samples = ArrayList<Sample>()
     private var lastDropPos: FloatArray? = null
     private var lastDropTime = 0L
+    @Volatile private var lastDropStamp = -1L
 
     /** Thread-safe copy of the samples for stats and CSV export. */
-    private data class Row(val timeMs: Long, val x: Float, val y: Float, val z: Float, val rssi: Int, val ssid: String?)
+    private data class Row(
+        val timeMs: Long, val x: Float, val y: Float, val z: Float, val rssi: Int,
+        val ssid: String?, val bssid: String?, val frequencyMhz: Int?,
+    )
     private val rows = java.util.Collections.synchronizedList(ArrayList<Row>())
 
     @Volatile private var autoDrop = true
@@ -70,6 +83,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     // ---- UI ----
     private lateinit var signalText: TextView
+    private lateinit var meaningText: TextView
     private lateinit var networkText: TextView
     private lateinit var statusText: TextView
     private lateinit var statsText: TextView
@@ -98,6 +112,34 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         cornerRadius = dp(14).toFloat()
     }
 
+    private fun pill(color: Int, radiusDp: Int = 50) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radiusDp).toFloat()
+    }
+
+    /** "● Excellent ● Good …" with each dot in its colour. */
+    private fun legendText(): CharSequence = SpannableStringBuilder().apply {
+        for (level in 4 downTo 0) {
+            if (level < 4) append("   ")
+            val dot = length
+            append("●")
+            setSpan(ForegroundColorSpan(SignalScale.levelColor(level)), dot, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            val label = length
+            append(" ").append(SignalScale.LABELS[level])
+            setSpan(ForegroundColorSpan(Color.rgb(0xD0, 0xD0, 0xD4)), label, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+
+    /** Phone-style bars "▂▄▆█" with [level] of them lit in [color]. */
+    private fun bars(level: Int, color: Int): CharSequence = SpannableStringBuilder().apply {
+        "▂▄▆█".forEachIndexed { i, c ->
+            val start = length
+            append(c)
+            val tint = if (i < level) color else Color.argb(80, 255, 255, 255)
+            setSpan(ForegroundColorSpan(tint), start, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+
     private fun buildLayout(): FrameLayout {
         val root = FrameLayout(this)
 
@@ -113,50 +155,96 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         overlay = OverlayView(this)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
-        // Top HUD
+        // Top card: how good the signal is, in words, and which network.
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = panel()
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(18), dp(14), dp(18), dp(14))
         }
         signalText = TextView(this).apply {
             setTextColor(Color.WHITE)
-            textSize = 26f
+            textSize = 24f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         }
-        networkText = TextView(this).apply { setTextColor(Color.rgb(0xB4, 0xB4, 0xB8)); textSize = 13f }
-        statsText = TextView(this).apply { setTextColor(Color.rgb(0xB4, 0xB4, 0xB8)); textSize = 13f }
-        statusText = TextView(this).apply { setTextColor(Color.rgb(0xF5, 0xA5, 0x24)); textSize = 13f }
+        meaningText = TextView(this).apply { setTextColor(Color.rgb(0xED, 0xED, 0xEF)); textSize = 15f }
+        val networkRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        networkText = TextView(this).apply {
+            setTextColor(Color.rgb(0xB4, 0xB4, 0xB8)); textSize = 14f
+            maxLines = 2
+            setOnClickListener { showNetworkPicker() }
+        }
+        val changeButton = TextView(this).apply {
+            text = "Change"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            background = pill(Color.rgb(0x3B, 0x82, 0xF6))
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            setOnClickListener { showNetworkPicker() }
+        }
+        networkRow.addView(networkText, LinearLayout.LayoutParams(0, -2, 1f))
+        networkRow.addView(changeButton)
+        statsText = TextView(this).apply {
+            setTextColor(Color.rgb(0xB4, 0xB4, 0xB8)); textSize = 14f
+            setPadding(0, dp(6), 0, 0)
+        }
+        statusText = TextView(this).apply {
+            setTextColor(Color.rgb(0xF5, 0xA5, 0x24)); textSize = 14f
+            setPadding(0, dp(6), 0, 0)
+        }
         top.addView(signalText)
-        top.addView(networkText)
+        top.addView(meaningText)
+        top.addView(networkRow)
         top.addView(statsText)
         top.addView(statusText)
         root.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply {
             setMargins(dp(12), dp(36), dp(12), 0)
         })
 
-        // Bottom controls
+        // Bottom: colour key, then the buttons.
         val bottom = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = LinearLayout.VERTICAL
             background = panel()
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+        }
+        val legend = TextView(this).apply {
+            text = legendText()
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(8))
+        }
+        val buttons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        fun button(label: String, onClick: () -> Unit) = Button(this).apply {
+        fun button(label: String, color: Int, onClick: () -> Unit) = Button(this).apply {
             text = label
             isAllCaps = false
-            textSize = 13f
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            background = pill(color, radiusDp = 12)
+            minHeight = dp(48)
+            stateListAnimator = null
             setOnClickListener { onClick() }
         }
-        autoButton = button("Auto: ON") {
+        val grey = Color.rgb(0x3A, 0x3A, 0x40)
+        autoButton = button("Pause", grey) {
             autoDrop = !autoDrop
-            autoButton.text = if (autoDrop) "Auto: ON" else "Auto: OFF"
+            autoButton.text = if (autoDrop) "Pause" else "Resume"
+            refreshHud()
         }
-        val dropButton = button("Drop here") { dropRequested = true }
-        val clearButton = button("Clear") { clearRequested = true }
-        val shareButton = button("Share CSV") { shareCsv() }
-        val lp = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(3), 0, dp(3), 0) }
-        listOf(autoButton, dropButton, clearButton, shareButton).forEach { bottom.addView(it, lp) }
+        val dropButton = button("Mark spot", Color.rgb(0x3B, 0x82, 0xF6)) { dropRequested = true }
+        val clearButton = button("Start over", grey) { confirmStartOver() }
+        val shareButton = button("Share", grey) { shareScan() }
+        val lp = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
+        listOf(autoButton, dropButton, clearButton, shareButton).forEach { buttons.addView(it, lp) }
+        bottom.addView(legend)
+        bottom.addView(buttons)
         root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
             setMargins(dp(12), 0, dp(12), dp(28))
         })
@@ -341,7 +429,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
 
         // Auto drop: every ~40 cm you walk, leave a bubble just below chest height.
-        if (autoDrop && rssi != null && now - lastDropTime > MIN_DROP_INTERVAL_MS) {
+        // Other networks only update when a scan lands: one bubble per reading, not repeats of an old one.
+        val freshReading = wifi.targetKey == null || wifi.readingStamp != lastDropStamp
+        if (autoDrop && rssi != null && freshReading && now - lastDropTime > MIN_DROP_INTERVAL_MS) {
             val last = lastDropPos
             if (last == null || distance(last, camPos) >= AUTO_DROP_SPACING_M) {
                 addSample(s, floatArrayOf(camPos[0], camPos[1] - 0.3f, camPos[2]), rssi, now)
@@ -384,8 +474,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             s.createAnchor(Pose.makeTranslation(pos[0], pos[1], pos[2]))
         } catch (e: Exception) { return }
         samples.add(Sample(anchor, rssi, now))
-        rows.add(Row(now, pos[0], pos[1], pos[2], rssi, wifi.ssid))
+        rows.add(Row(now, pos[0], pos[1], pos[2], rssi, wifi.ssid, wifi.bssid, wifi.frequencyMhz))
         lastDropTime = now
+        lastDropStamp = wifi.readingStamp
         if (samples.size > MAX_SAMPLES) {
             samples.removeAt(0).anchor.detach()
         }
@@ -403,49 +494,163 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         overlay.liveRssi = rssi
         overlay.postInvalidateOnAnimation()
 
+        val following = wifi.targetKey != null
+        val name = wifi.ssid ?: if (following) wifi.targetKey else null
         if (rssi == null) {
-            signalText.text = "No Wi-Fi connection"
-            signalText.setTextColor(Color.GRAY)
-            networkText.text = "Connect to the network you want to map."
+            signalText.text = if (following) "Can't find this Wi-Fi here" else "Not connected to Wi-Fi"
+            signalText.setTextColor(Color.rgb(0xB4, 0xB4, 0xB8))
+            meaningText.text = if (following) "Move closer to it, or tap Change to pick another."
+            else "Connect to Wi-Fi, or tap Change to check any nearby network."
         } else {
-            signalText.text = "$rssi dBm · ${SignalScale.label(rssi)}"
-            signalText.setTextColor(SignalScale.color(rssi))
-            val name = wifi.ssid ?: "Network name hidden (allow location to show it)"
-            val extras = listOfNotNull(wifi.bandLabel(), wifi.linkMbps?.let { "$it Mbps link" })
-            networkText.text = (listOf(name) + extras).joinToString(" · ")
+            val color = SignalScale.color(rssi)
+            val level = SignalScale.level(rssi)
+            signalText.text = SpannableStringBuilder()
+                .append(bars(level, color))
+                .append("  ")
+                .append(if (level == 0) "No usable signal" else "${SignalScale.label(rssi)} signal")
+                .append("  ·  $rssi dBm")
+            signalText.setTextColor(color)
+            meaningText.text = SignalScale.meaning(rssi)
+        }
+        networkText.text = when {
+            name == null && following -> "Checking: hidden network"
+            name == null -> "Checking: your Wi-Fi"
+            following -> "Checking: $name\nUpdated ${wifi.readingAgeMs / 1000} seconds ago"
+            else -> "Checking: $name (your Wi-Fi)"
         }
 
-        val snapshot = synchronized(rows) { rows.map { it.rssi } }
-        statsText.text = if (snapshot.isEmpty()) {
-            "Walk slowly around the room. Bubbles appear where you've been."
-        } else {
-            "${snapshot.size} points · best ${snapshot.max()} dBm · worst ${snapshot.min()} dBm"
+        val levels = synchronized(rows) { rows.map { it.rssi } }
+        statsText.text = when {
+            levels.isEmpty() && autoDrop -> "Walk slowly around. A coloured bubble marks the signal at each spot."
+            levels.isEmpty() -> "Paused. Tap Mark spot to add a bubble, or Resume."
+            else -> {
+                val spots = if (levels.size == 1) "1 spot checked" else "${levels.size} spots checked"
+                "$spots · best: ${SignalScale.label(levels.max())} · worst: ${SignalScale.label(levels.min())}" +
+                    if (autoDrop) "" else " · paused"
+            }
         }
 
-        val msg = trackingMessage
+        val msg = trackingMessage ?: if (following && wifi.scanThrottled) {
+            "This network only refreshes about every 30 seconds. Stand still at each spot for a moment."
+        } else null
         statusText.text = msg ?: ""
-        statusText.visibility = if (msg == null) android.view.View.GONE else android.view.View.VISIBLE
+        statusText.visibility = if (msg == null) View.GONE else View.VISIBLE
     }
 
-    private fun shareCsv() {
+    private fun showNetworkPicker() {
+        val hasLocation = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!hasLocation) {
+            Toast.makeText(this, "To see nearby Wi-Fi, Android needs Location permission.", Toast.LENGTH_LONG).show()
+            requestPermissions()
+            return
+        }
+        val connected = wifi.connectedSsid
+        // Hidden networks have no name to show, so leave them out; the connected one is listed first.
+        val others = wifi.nearby.filter { it.ssid != null && it.ssid != connected }
+        val grey = Color.rgb(0x9A, 0x9A, 0xA0)
+        fun greyText(text: String) = SpannableStringBuilder(text).apply {
+            setSpan(ForegroundColorSpan(grey), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        fun item(title: String, detail: CharSequence) = SpannableStringBuilder().apply {
+            append(title)
+            setSpan(StyleSpan(Typeface.BOLD), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            append("\n")
+            val start = length
+            append(detail)
+            setSpan(RelativeSizeSpan(0.85f), start, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        fun detail(rssi: Int) = SpannableStringBuilder()
+            .append(bars(SignalScale.level(rssi), SignalScale.color(rssi)))
+            .append("  ")
+            .append(greyText("${SignalScale.label(rssi)} · $rssi dBm"))
+
+        val first = if (connected != null) item(connected, greyText("Your Wi-Fi · updates live"))
+        else item("Your Wi-Fi", greyText("Not connected right now"))
+        val items = listOf<CharSequence>(first) + others.map { item(it.ssid!!, detail(it.rssi)) }
+        val current = wifi.targetKey?.let { key -> others.indexOfFirst { it.key == key }.let { if (it < 0) -1 else it + 1 } } ?: 0
+        val title = when {
+            others.isNotEmpty() -> "Which Wi-Fi do you want to check?"
+            !wifi.locationEnabled -> "Turn on Location to see other Wi-Fi nearby"
+            else -> "Looking for nearby Wi-Fi… try again in a few seconds"
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(items.toTypedArray(), current) { dialog, which ->
+                val pick = if (which == 0) null else others[which - 1]
+                if (pick?.key != wifi.targetKey) {
+                    wifi.follow(pick)
+                    clearRequested = true // bubbles from the old network would be misleading
+                    lastDropStamp = -1L
+                    refreshHud()
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun confirmStartOver() {
+        val count = rows.size
+        if (count == 0) {
+            clearRequested = true
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Start over?")
+            .setMessage("This removes the $count ${if (count == 1) "spot" else "spots"} you've checked so far.")
+            .setPositiveButton("Start over") { _, _ -> clearRequested = true }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Shares a plain-language summary, with the full data attached as a spreadsheet (CSV). */
+    private fun shareScan() {
         val snapshot = synchronized(rows) { rows.toList() }
         if (snapshot.isEmpty()) {
-            Toast.makeText(this, "No points yet. Walk around first.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Nothing to share yet. Walk around first.", Toast.LENGTH_SHORT).show()
             return
         }
         val csv = buildString {
-            append("timestamp_ms,x_m,y_m,z_m,rssi_dbm,ssid\n")
+            append("timestamp_ms,x_m,y_m,z_m,rssi_dbm,ssid,bssid,frequency_mhz\n")
             for (r in snapshot) {
-                append(String.format(Locale.US, "%d,%.3f,%.3f,%.3f,%d,%s\n",
-                    r.timeMs, r.x, r.y, r.z, r.rssi, (r.ssid ?: "").replace(",", " ")))
+                append(String.format(Locale.US, "%d,%.3f,%.3f,%.3f,%d,%s,%s,%s\n",
+                    r.timeMs, r.x, r.y, r.z, r.rssi, (r.ssid ?: "").replace(",", " "),
+                    r.bssid ?: "", r.frequencyMhz?.toString() ?: ""))
             }
         }
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "SignalLens Wi-Fi scan")
-            putExtra(Intent.EXTRA_TEXT, csv)
+        val best = snapshot.maxOf { it.rssi }
+        val worst = snapshot.minOf { it.rssi }
+        val counts = snapshot.groupingBy { SignalScale.level(it.rssi) }.eachCount()
+        val network = snapshot.first().ssid ?: "Wi-Fi"
+        val summary = buildString {
+            append("SignalLens Wi-Fi check: $network\n")
+            append("${snapshot.size} spots checked\n")
+            append("Best spot: ${SignalScale.label(best)} ($best dBm)\n")
+            append("Worst spot: ${SignalScale.label(worst)} ($worst dBm)\n")
+            append((4 downTo 0).joinToString(" · ") { "${SignalScale.LABELS[it]}: ${counts[it] ?: 0}" })
+            append("\n\nFull data is attached as a spreadsheet (CSV).")
         }
-        startActivity(Intent.createChooser(send, "Share scan"))
+
+        val send = Intent(Intent.ACTION_SEND).apply {
+            putExtra(Intent.EXTRA_SUBJECT, "SignalLens Wi-Fi check: $network")
+            putExtra(Intent.EXTRA_TEXT, summary)
+        }
+        val uri = try {
+            val dir = java.io.File(cacheDir, "scans").apply { mkdirs() }
+            val safeName = network.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            val file = java.io.File(dir, "signallens-$safeName.csv").apply { writeText(csv) }
+            FileProvider.getUriForFile(this, "$packageName.files", file)
+        } catch (e: Exception) { null }
+        if (uri != null) {
+            send.type = "text/csv"
+            send.putExtra(Intent.EXTRA_STREAM, uri)
+            send.clipData = ClipData.newRawUri("", uri)
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } else {
+            send.type = "text/plain" // attachment failed: share the summary alone
+        }
+        startActivity(Intent.createChooser(send, "Share Wi-Fi check"))
     }
 
     companion object {

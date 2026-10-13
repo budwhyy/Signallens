@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Lets the app request Wi-Fi scans to read the signal of networks it is not connected to. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <!-- Android only reveals the Wi-Fi network name (SSID) to apps with location permission. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
@@ -17,6 +19,17 @@
         android:theme="@style/Theme.SignalLens">
 
         <meta-data android:name="com.google.ar.core" android:value="required" />
+
+        <!-- Lets the Share button attach the scan spreadsheet. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"

@@ -507,9 +507,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             signalText.text = SpannableStringBuilder()
                 .append(bars(level, color))
                 .append("  ")
-                .append(if (level == 0) "No usable signal" else "${SignalScale.label(rssi)} signal")
-                .append("  ·  $rssi dBm")
+                .append("${SignalScale.label(rssi)}  ·  $rssi dBm")
             signalText.setTextColor(color)
+            signalText.maxLines = 1
             meaningText.text = SignalScale.meaning(rssi)
         }
         networkText.text = when {
